@@ -231,6 +231,8 @@ jobs:
           CONFIG_TARGET_x86=y
           CONFIG_TARGET_x86_64=y
 
+          # WAJIB DITAMBAHKAN AGAR TIDAK DI-STRIP OLEH DEFCONFIG
+          CONFIG_PACKAGE_kmod-sound-core=m
           CONFIG_PACKAGE_kmod-sound-hda-core=m
           CONFIG_PACKAGE_kmod-sound-hda-codec-realtek=m
           CONFIG_PACKAGE_kmod-sound-hda-codec-generic=m
@@ -514,49 +516,6 @@ jobs:
           echo "BUILDING KERNEL CORE"
           echo "=========================================="
           make target/linux/compile -j$(nproc) V=s
-
-      # ============================================================
-      # BUILD SOUND MODULES DIRECTLY (BYPASS OPENWRT PACKAGING)
-      # ============================================================
-      - name: Build custom sound modules
-        working-directory: openwrt
-        run: |
-          KERNEL_DIR="${{ steps.kernel.outputs.kernel_dir }}"
-          
-          echo "=========================================="
-          echo "APPENDING HDA CONFIGS TO KERNEL"
-          echo "=========================================="
-          # Kita memaksa kernel mengaktifkan modul suara
-          cat >> "$KERNEL_DIR/.config" <<'EOF'
-          CONFIG_SOUND=m
-          CONFIG_SND=m
-          CONFIG_SND_HDA=m
-          CONFIG_SND_HDA_INTEL=m
-          CONFIG_SND_HDA_CODEC_REALTEK=m
-          CONFIG_SND_HDA_CODEC_GENERIC=m
-          CONFIG_SND_HDA_HWDEP=y
-          EOF
-          
-          echo "=========================================="
-          echo "RUNNING OLDDEFCONFIG (SILENT CONFIG)"
-          echo "=========================================="
-          export PATH="${{ steps.toolchain.outputs.toolchain_root }}/bin:$PATH"
-          export STAGING_DIR="$GITHUB_WORKSPACE/openwrt/staging_dir"
-          
-          # olddefconfig akan meresolve dependensi tanpa memunculkan prompt interaktif (Y/N)
-          make -C "$KERNEL_DIR" \
-            ARCH=x86 \
-            CROSS_COMPILE=x86_64-openwrt-linux-musl- \
-            olddefconfig
-            
-          echo "=========================================="
-          echo "COMPILING SOUND SUBTREE"
-          echo "=========================================="
-          # Memaksa kernel meng-compile seluruh sub-direktori 'sound'
-          make -C "$KERNEL_DIR" \
-            ARCH=x86 \
-            CROSS_COMPILE=x86_64-openwrt-linux-musl- \
-            M=sound modules -j$(nproc)
 
       # ============================================================
       # FIND REALTEK MODULE DIRECTLY IN KERNEL BUILD TREE
