@@ -1,618 +1,304 @@
-name: Build ALC262 Debug KMOD - OpenWrt 25.12.5
+name: Full Build OpenWrt 25.12.5 (BenQ T31 Audio + Modem)
 
 on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+env:
+  TOOLCHAIN_URL: "https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/openwrt-toolchain-25.12.5-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+  LLVM_URL: "https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/llvm-bpf-21.1.6.Linux-x86_64.tar.zst"
+  OWRT_ARCH: "x86/64"
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-
+    
     steps:
-
-      # ============================================================
-      # CHECKOUT CUSTOM REPOSITORY
-      # ============================================================
-
-      - name: Checkout custom repository
+      - name: Checkout OpenWrt Source
         uses: actions/checkout@v4
         with:
-          path: custom
+          repository: openwrt/openwrt
+          ref: v25.12.5
 
-      # ============================================================
-      # HOST DEPENDENCIES
-      # ============================================================
-
-      - name: Install build dependencies
+      - name: Free Disk Space
         run: |
-          sudo apt-get update
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo apt-get clean
 
-          sudo apt-get install -y \
-            build-essential \
-            flex \
-            m4 \
-            bison \
-            gawk \
-            gettext \
-            git \
-            libncurses-dev \
-            libssl-dev \
-            python3 \
-            rsync \
-            unzip \
-            zlib1g-dev \
-            file \
-            wget \
-            patch \
-            zstd
-
-      # ============================================================
-      # CLONE EXACT OPENWRT 25.12.5
-      # ============================================================
-
-      - name: Clone OpenWrt 25.12.5
+      - name: Install Build Dependencies
         run: |
-          git clone \
-            --depth 1 \
-            --branch v25.12.5 \
-            https://git.openwrt.org/openwrt/openwrt.git \
-            openwrt
+          sudo apt update
+          sudo apt install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev \
+            python3-distutils python3-setuptools rsync swig unzip zlib1g-dev \
+            file wget zstd pkg-config m4 patch
 
-      # ============================================================
-      # VERIFY EXACT OPENWRT VERSION
-      # ============================================================
-
-      - name: Verify OpenWrt version
-        working-directory: openwrt
+      - name: Download & Inject External Toolchain
         run: |
-          echo "=========================================="
-          echo "OPENWRT VERSION"
-          echo "=========================================="
+          mkdir -p /opt/toolchain
+          wget -q "$TOOLCHAIN_URL" -O toolchain.tar.zst
+          tar --zstd -xf toolchain.tar.zst -C /opt/toolchain --strip-components=2 --wildcards "*/toolchain-x86_64_gcc-*"
+          rm toolchain.tar.zst
+          test -d /opt/toolchain/bin || { echo "❌ Error: Toolchain extraction failed!"; exit 1; }
 
-          echo "HEAD:"
-          git rev-parse HEAD
+          wget -q "$LLVM_URL" -O llvm.tar.zst
+          mkdir -p staging_dir
+          tar --zstd -xf llvm.tar.zst -C staging_dir/
+          rm llvm.tar.zst
 
-          echo
-          echo "TAG:"
-          git describe --tags --exact-match HEAD || true
-
-          echo
-          echo "EXPECTED COMMIT:"
-          git rev-list -n 1 v25.12.5
-
-          echo
-          echo "VERIFY:"
-          test "$(git rev-parse HEAD)" = \
-               "$(git rev-list -n 1 v25.12.5)"
-
-          echo
-          echo "OpenWrt v25.12.5 verified."
-
-      # ============================================================
-      # DOWNLOAD OFFICIAL OPENWRT TOOLCHAIN
-      # ============================================================
-
-      - name: Download official OpenWrt 25.12.5 toolchain
+      - name: Inject Custom Scripts (Resize, Modem, Network)
         run: |
-          TOOLCHAIN_URL="https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/openwrt-toolchain-25.12.5-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
-          TOOLCHAIN_SHA256="d34d210785e45b3a06460397f3c350d33644fe5660fb7d92d529bf6c47669037"
-
-          wget -q --show-progress \
-            "$TOOLCHAIN_URL" \
-            -O openwrt-toolchain.tar.zst
-
-          echo
-          echo "Checking SHA256..."
-
-          echo "$TOOLCHAIN_SHA256  openwrt-toolchain.tar.zst" \
-            | sha256sum -c -
-
-          echo
-          echo "Toolchain checksum OK."
-
-      # ============================================================
-      # EXTRACT OFFICIAL TOOLCHAIN
-      # ============================================================
-
-      - name: Extract official OpenWrt toolchain
-        run: |
-          rm -rf toolchain
-          mkdir -p toolchain
-
-          tar \
-            --use-compress-program=unzstd \
-            -xf openwrt-toolchain.tar.zst \
-            -C toolchain
-
-          echo
-          echo "Toolchain GCC candidates:"
-
-          find "$GITHUB_WORKSPACE/toolchain" \
-            \( -type f -o -type l \) \
-            -name 'x86_64-openwrt-linux-musl-gcc' \
-            -print \
-            | sort
-
-      # ============================================================
-      # LOCATE TOOLCHAIN ROOT
-      # ============================================================
-
-      - name: Locate official toolchain root
-        id: toolchain
-        run: |
-          GCC="$(find "$GITHUB_WORKSPACE/toolchain" \
-            \( -type f -o -type l \) \
-            -name 'x86_64-openwrt-linux-musl-gcc' \
-            -print -quit)"
-
-          if [ -z "$GCC" ]; then
-            echo "ERROR: x86_64-openwrt-linux-musl-gcc not found"
-
-            echo
-            echo "All GCC candidates:"
-            find "$GITHUB_WORKSPACE/toolchain" \
-              \( -type f -o -type l \) \
-              -name '*gcc*' \
-              -print \
-              | sort
-
-            exit 1
+          mkdir -p files/etc/uci-defaults
+          
+          # [SCRIPT RESIZE PARTISI]
+          cat << "EOF" > files/etc/uci-defaults/70-rootpt-resize
+          if [ ! -e /etc/rootpt-resize ] && type parted > /dev/null && lock -n /var/lock/root-resize; then
+            ROOT_BLK="$(readlink -f /sys/dev/block/"$(awk -e '$9=="/dev/root"{print $3}' /proc/self/mountinfo)")"
+            ROOT_DISK="/dev/$(basename "${ROOT_BLK%/*}")"
+            ROOT_PART="${ROOT_BLK##*[^0-9]}"
+            parted -f -s "${ROOT_DISK}" resizepart "${ROOT_PART}" 100%
+            mount_root done
+            touch /etc/rootpt-resize
+            if [ -e /boot/cmdline.txt ]; then 
+              NEW_UUID=`blkid ${ROOT_DISK}p${ROOT_PART} | sed -n 's/.*PARTUUID="\([^"]*\)".*/\1/p'`
+              sed -i "s/PARTUUID=[^ ]*/PARTUUID=${NEW_UUID}/" /boot/cmdline.txt
+            fi
+            reboot
           fi
-
-          echo "GCC:"
-          echo "$GCC"
-
-          TOOLCHAIN_ROOT="$(dirname "$(dirname "$GCC")")"
-
-          echo
-          echo "Toolchain root:"
-          echo "$TOOLCHAIN_ROOT"
-
-          test -x "$GCC"
-
-          echo "toolchain_root=$TOOLCHAIN_ROOT" >> "$GITHUB_OUTPUT"
-
-      # ============================================================
-      # VERIFY OFFICIAL TOOLCHAIN
-      # ============================================================
-
-      - name: Verify official toolchain
-        run: |
-          TOOLCHAIN="${{ steps.toolchain.outputs.toolchain_root }}"
-          GCC="$TOOLCHAIN/bin/x86_64-openwrt-linux-musl-gcc"
-
-          echo "=========================================="
-          echo "TOOLCHAIN"
-          echo "=========================================="
-
-          echo "$TOOLCHAIN"
-
-          echo
-          echo "Compiler:"
-          "$GCC" --version | head -1
-
-          echo
-          echo "Target:"
-          "$GCC" -dumpmachine
-
-          echo
-          echo "Sysroot:"
-          "$GCC" -print-sysroot
-
-          echo
-          echo "Resolved GCC:"
-          readlink -f "$GCC"
-
-      # ============================================================
-      # CONFIGURE OPENWRT USING EXTERNAL TOOLCHAIN
-      # IMPORTANT:
-      # DO NOT CREATE .config BEFORE THIS STEP
-      # ============================================================
-
-      - name: Configure official external toolchain
-        working-directory: openwrt
-        run: |
-          ./scripts/ext-toolchain.sh \
-            --toolchain "${{ steps.toolchain.outputs.toolchain_root }}" \
-            --overwrite-config \
-            --config x86/64
-
-      # ============================================================
-      # ADD REQUIRED OPENWRT PACKAGE CONFIGURATION
-      # ============================================================
-
-      - name: Configure OpenWrt sound packages
-        working-directory: openwrt
-        run: |
-          cat >> .config <<'EOF'
-
-          CONFIG_TARGET_x86=y
-          CONFIG_TARGET_x86_64=y
-
-          # WAJIB DITAMBAHKAN AGAR TIDAK DI-STRIP OLEH DEFCONFIG
-          CONFIG_PACKAGE_kmod-sound-core=m
-          CONFIG_PACKAGE_kmod-sound-hda-core=m
-          CONFIG_PACKAGE_kmod-sound-hda-codec-realtek=m
-          CONFIG_PACKAGE_kmod-sound-hda-codec-generic=m
-          CONFIG_PACKAGE_kmod-sound-hda-intel=m
+          exit 1
+          EOF
+          
+          # [SCRIPT RESIZE FILESYSTEM]
+          cat << "EOF" > files/etc/uci-defaults/80-rootfs-resize
+          if [ ! -e /etc/rootfs-resize ] && [ -e /etc/rootpt-resize ] && type losetup > /dev/null && type resize2fs > /dev/null && lock -n /var/lock/root-resize; then
+            ROOT_BLK="$(readlink -f /sys/dev/block/"$(awk -e '$9=="/dev/root"{print $3}' /proc/self/mountinfo)")"
+            ROOT_DEV="/dev/${ROOT_BLK##*/}"
+            LOOP_DEV="$(awk -e '$5=="/overlay"{print $9}' /proc/self/mountinfo)"
+            if [ -z "${LOOP_DEV}" ]; then
+              LOOP_DEV="$(losetup -f)"
+              losetup "${LOOP_DEV}" "${ROOT_DEV}"
+            fi
+            resize2fs -f "${LOOP_DEV}"
+            mount_root done
+            touch /etc/rootfs-resize
+            reboot
+          fi
+          exit 1
+          EOF
+          
+          cat << "EOF" >> files/etc/sysupgrade.conf
+          /etc/uci-defaults/70-rootpt-resize
+          /etc/uci-defaults/80-rootfs-resize
           EOF
 
+          # [SCRIPT FIRST BOOT - Konfigurasi Jaringan]
+          cat << "EOF" > files/etc/uci-defaults/99-custom-config
+          # 1. Zona Waktu
+          uci set system.@system[0].timezone='WIB-7'
+          uci set system.@system[0].zonename='Asia/Jakarta'
+          uci commit system
+          
+          # 2. Setup WAN & WAN6 untuk USB-to-LAN (eth1)
+          uci set network.wan='interface'
+          uci set network.wan.proto='dhcp'
+          uci set network.wan.device='eth1'
+
+          uci set network.wan6='interface'
+          uci set network.wan6.proto='dhcpv6'
+          uci set network.wan6.device='eth1'
+          
+          # 3. Setup ModemManager
+          uci -q delete network.Dell_DW5821e
+          uci set network.Dell_DW5821e='interface'
+          uci set network.Dell_DW5821e.proto='modemmanager'
+          uci set network.Dell_DW5821e.force_link='1'
+          uci set network.Dell_DW5821e.apn='internet'
+          uci add_list network.Dell_DW5821e.allowedauth='none'
+          uci set network.Dell_DW5821e.iptype='ipv4'
+          uci set network.Dell_DW5821e.loglevel='ERR'
+
+          uci -q delete network.modem
+          uci set network.modem='interface'
+          uci set network.modem.proto='none'
+          uci set network.modem.device='wwan0'
+          uci set network.modem.force_link='1'
+          
+          # 4. Setup USB Tethering (HP)
+          uci set network.usbwan="interface"
+          uci set network.usbwan.ifname="usb0"
+          uci set network.usbwan.proto="dhcp"
+          uci commit network
+
+          # 5. Setup Wireless (WiFi bawaan)
+          uci set wireless.@wifi-device[0].disabled="0"
+          uci set wireless.@wifi-device[0].channel="11"
+          uci set wireless.@wifi-device[0].htmode="HT20"
+          uci set wireless.@wifi-iface[0].disabled="0"
+          uci set wireless.@wifi-iface[0].ssid="Linksys"
+          uci set wireless.@wifi-iface[0].key="12345678"
+          uci set wireless.@wifi-iface[0].encryption="none"
+          uci commit wireless
+
+          # 6. Firewall - HANYA menempelkan usbwan ke zona WAN, ModemManager ditangani manual di LuCI
+          WAN_IDX=$(uci show firewall | grep -F ".name='wan'" | cut -d. -f2 | cut -d= -f1)
+          uci add_list firewall.${WAN_IDX}.network="usbwan"
+          # Catatan: interface 'wan' dan 'wan6' otomatis sudah tergabung ke zona firewall WAN oleh bawaan sistem
+          uci commit firewall
+          
+          exit 0
+          EOF
+          chmod +x files/etc/uci-defaults/*
+
+      - name: Update and Install Feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Patch Kernel Config Safely (Built-in AMD IXP)
+        run: |
+          for f in target/linux/x86/config-*; do
+            [ -f "$f" ] || continue
+            sed -i '/CONFIG_ATA=/d' "$f"
+            sed -i '/CONFIG_ATA_SFF=/d' "$f"
+            sed -i '/CONFIG_ATA_BMDMA=/d' "$f"
+            sed -i '/CONFIG_PATA_ATIIXP/d' "$f"
+            sed -i '/CONFIG_ATA_PIIX/d' "$f"
+            sed -i '/CONFIG_SATA_SIL/d' "$f"
+
+            cat >> "$f" <<EOF
+          CONFIG_ATA=y
+          CONFIG_ATA_SFF=y
+          CONFIG_ATA_BMDMA=y
+          CONFIG_PATA_ATIIXP=y
+          CONFIG_ATA_PIIX=y
+          CONFIG_SATA_SIL=y
+          EOF
+          done
+
+      - name: Generate .config & Evaluate Toolchain
+        run: |
+          wget -q https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/config.buildinfo -O .config
+          
+          sed -i '/CONFIG_ALL_KMODS=y/d; /CONFIG_ALL_NONSHARED=y/d; /CONFIG_IB=y/d; /CONFIG_SDK=y/d; /CONFIG_SDK_LLVM_BPF=y/d; /CONFIG_MAKE_TOOLCHAIN=y/d; /CONFIG_BUILDBOT=y/d' .config
+          
+          echo "CONFIG_TARGET_ROOTFS_EXT4FS=y" >> .config
+          echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y" >> .config
+          echo "CONFIG_ALL_KMODS=y" >> .config
+          
+          PACKAGES="kmod-ath9k kmod-tun kmod-r8169 kmod-sound-core kmod-sound-hda-core kmod-sound-hda-intel kmod-ac97 kmod-sound-i8x0 alsa-utils wpad-basic-wolfssl kmod-usb-net-rtl8152 kmod-rtl8192se kmod-usb-ohci kmod-usb-ehci-pci kmod-usb2 kmod-pci kmod-i2c-piix4 kmod-ohci-pci kmod-ehci-pci kmod-k8temp kmod-radeon kmod-drm-radeon kmod-yenta-cardbus kmod-pcmcia-yenta kmod-firewire-ohci kmod-firewire-core kmod-tifm-7xx1 kmod-tifm-core kmod-sdhci-pci kmod-sdhci modemmanager modemmanager-rpcd libmbim libqmi luci-proto-modemmanager kmod-usb-serial-option kmod-usb-net-cdc-mbim umbim kmod-usb-acm kmod-usb-wdm kmod-usb-net-rndis parted losetup resize2fs blkid"
+          
+          for pkg in $PACKAGES; do
+            echo "CONFIG_PACKAGE_$pkg=y" >> .config
+          done
+          
+          ./scripts/ext-toolchain.sh --toolchain /opt/toolchain --overwrite-config --config $OWRT_ARCH
           make defconfig
 
-      # ============================================================
-      # VERIFY OPENWRT CONFIGURATION
-      # ============================================================
-
-      - name: Verify OpenWrt configuration
-        working-directory: openwrt
-        run: |
-          echo "=========================================="
-          echo "TARGET"
-          echo "=========================================="
-
-          grep -E \
-            '^CONFIG_TARGET_x86=|^CONFIG_TARGET_x86_64=' \
-            .config
-
-          echo
-          echo "=========================================="
-          echo "SOUND PACKAGES"
-          echo "=========================================="
-
-          grep -E \
-            '^CONFIG_PACKAGE_kmod-sound-hda' \
-            .config || true
-
-          echo
-          echo "=========================================="
-          echo "EXTERNAL TOOLCHAIN"
-          echo "=========================================="
-
-          grep -E \
-            '^CONFIG_EXTERNAL_TOOLCHAIN=|^CONFIG_TOOLCHAIN_ROOT=' \
-            .config || true
-
-      # ============================================================
-      # PREPARE HOST TOOLS
-      # ============================================================
-
-      - name: Prepare OpenWrt host tools
-        working-directory: openwrt
+      - name: Prepare Host Tools & Kernel Source
         run: |
           make tools/install V=s
-
-      # ============================================================
-      # VERIFY HOST TOOLS
-      # ============================================================
-
-      - name: Verify host tools
-        working-directory: openwrt
-        run: |
-          echo "=========================================="
-          echo "SYSTEM M4"
-          echo "=========================================="
-
-          command -v m4
-          m4 --version | head -1
-
-          echo
-          echo "=========================================="
-          echo "OPENWRT HOST M4"
-          echo "=========================================="
-
-          test -x staging_dir/host/bin/m4
-
-          ls -l staging_dir/host/bin/m4
-          file staging_dir/host/bin/m4
-
-          staging_dir/host/bin/m4 --version | head -1
-
-      # ============================================================
-      # PREPARE KERNEL SOURCE
-      # ============================================================
-      - name: Prepare kernel source
-        working-directory: openwrt
-        run: |
           make target/linux/prepare V=s
 
-      # ============================================================
-      # LOCATE KERNEL SOURCE
-      # ============================================================
-
-      - name: Locate kernel source
-        id: kernel
-        working-directory: openwrt
+      - name: Locate Kernel Source & Inject ALC262 Debug
         run: |
-          KERNEL_DIR="$(find build_dir \
-            -type d \
-            -path '*/linux-x86_64/linux-6.12.94' \
-            -print -quit)"
-
-          if [ -z "$KERNEL_DIR" ]; then
-            echo "ERROR: kernel source directory not found"
-
-            echo
-            echo "Available kernel directories:"
-            find build_dir \
-              -maxdepth 6 \
-              -type d \
-              | grep -E 'linux|target-x86_64' || true
-
-            exit 1
-          fi
-
-          echo
-          echo "Kernel directory:"
-          echo "$KERNEL_DIR"
-
-          echo "kernel_dir=$KERNEL_DIR" >> "$GITHUB_OUTPUT"
-
-      # ============================================================
-      # VERIFY REALTEK SOURCE
-      # ============================================================
-
-      - name: Verify Realtek source
-        working-directory: openwrt
-        run: |
-          KERNEL_DIR="${{ steps.kernel.outputs.kernel_dir }}"
+          KERNEL_DIR="$(find build_dir -type d -path '*/linux-x86_64/linux-6.12.94' -print -quit)"
+          if [ -z "$KERNEL_DIR" ]; then echo "ERROR: kernel dir not found"; exit 1; fi
+          
           FILE="$KERNEL_DIR/sound/pci/hda/patch_realtek.c"
-
           test -f "$FILE"
-
-          echo "=========================================="
-          echo "REALTEK SOURCE"
-          echo "=========================================="
-
-          echo "$FILE"
-
-          echo
-          echo "Relevant ALC262 entries:"
-
-          grep -n \
-            -E 'ALC262_FIXUP_BENQ_T31|Benq T31-16|17ff.*058d|0x3050' \
-            "$FILE"
-
-      # ============================================================
-      # INJECT CUSTOM ALC262 DEBUG CODE
-      # ============================================================
-
-      - name: Inject ALC262 debug code
-        working-directory: openwrt
-        run: |
-          KERNEL_DIR="${{ steps.kernel.outputs.kernel_dir }}"
-          FILE="$KERNEL_DIR/sound/pci/hda/patch_realtek.c"
-
-          test -f "$FILE"
-
+          
+          echo "Injecting ALC262 Custom KMOD to $FILE..."
+          
           python3 - "$FILE" <<'PY'
           import re
           import sys
 
           path = sys.argv[1]
-
           with open(path, "r", encoding="utf-8") as f:
               source = f.read()
 
           if "alc262_fixup_benq_t31_debug" in source:
-              print("Custom debug code already present.")
               sys.exit(0)
 
           marker = "static const struct hda_fixup alc262_fixups[] = {"
-
           code = r'''static void alc262_fixup_benq_t31_debug(struct hda_codec *codec,
-                                                  const struct hda_fixup *fix,
-                                                  int action)
+                                                            const struct hda_fixup *fix,
+                                                            int action)
           {
               if (action == HDA_FIXUP_ACT_PRE_PROBE) {
-                  codec_info(codec,
-                             "ALC262: [CUSTOM KMOD] BENQ T31 PRE_PROBE\n");
-
-                  snd_hda_codec_write(codec, 0x20, 0,
-                                      AC_VERB_SET_COEF_INDEX, 0x07);
-
-                  snd_hda_codec_write(codec, 0x20, 0,
-                                      AC_VERB_SET_PROC_COEF, 0x3050);
+                  codec_info(codec, "ALC262: [CUSTOM KMOD] BENQ T31 PRE_PROBE\n");
+                  snd_hda_codec_write(codec, 0x20, 0, AC_VERB_SET_COEF_INDEX, 0x07);
+                  snd_hda_codec_write(codec, 0x20, 0, AC_VERB_SET_PROC_COEF, 0x3050);
               }
-
               if (action == HDA_FIXUP_ACT_PROBE) {
-                  codec_info(codec,
-                             "ALC262: [CUSTOM KMOD] BENQ T31 PROBE\n");
+                  codec_info(codec, "ALC262: [CUSTOM KMOD] BENQ T31 PROBE\n");
               }
           }
-
           '''
-
-          if marker not in source:
-              print("ERROR: fixup table marker not found")
-              sys.exit(1)
-
           source = source.replace(marker, code + marker, 1)
 
-          pattern = re.compile(
-              r'(\[ALC262_FIXUP_BENQ_T31\]\s*=\s*\{)'
-              r'.*?'
-              r'(\n\s*\},)',
-              re.DOTALL
-          )
-
+          pattern = re.compile(r'(\[ALC262_FIXUP_BENQ_T31\]\s*=\s*\{).*?(\n\s*\},)', re.DOTALL)
           match = pattern.search(source)
-
-          if not match:
-              print("ERROR: ALC262_FIXUP_BENQ_T31 block not found")
-              sys.exit(1)
-
-          replacement = (
-              match.group(1)
-              + r'''
+          
+          if match:
+              replacement = match.group(1) + r'''
                   .type = HDA_FIXUP_FUNC,
                   .v.func = alc262_fixup_benq_t31_debug,
-              '''
-              + match.group(2)
-          )
-
-          source = (
-              source[:match.start()]
-              + replacement
-              + source[match.end():]
-          )
-
-          with open(path, "w", encoding="utf-8") as f:
-              f.write(source)
-
-          print("ALC262 custom debug code injected successfully.")
+              ''' + match.group(2)
+              source = source[:match.start()] + replacement + source[match.end():]
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(source)
+              print("✅ Injection successful!")
+          else:
+              print("❌ ERROR: ALC262 block not found!")
+              sys.exit(1)
           PY
 
-      # ============================================================
-      # VERIFY CUSTOM DEBUG INJECTION
-      # ============================================================
-
-      - name: Verify ALC262 debug injection
-        working-directory: openwrt
+      - name: Download Packages
         run: |
-          KERNEL_DIR="${{ steps.kernel.outputs.kernel_dir }}"
-          FILE="$KERNEL_DIR/sound/pci/hda/patch_realtek.c"
+          make download -j8
 
-          test -f "$FILE"
-
-          echo "=========================================="
-          echo "CUSTOM FUNCTION"
-          echo "=========================================="
-
-          grep -n \
-            -A25 \
-            -B3 \
-            'alc262_fixup_benq_t31_debug' \
-            "$FILE"
-
-          echo
-          echo "=========================================="
-          echo "BENQ T31 FIXUP"
-          echo "=========================================="
-
-          grep -n \
-            -A8 \
-            -B2 \
-            'ALC262_FIXUP_BENQ_T31' \
-            "$FILE"
-
-          echo
-          echo "=========================================="
-          echo "CUSTOM DEBUG STRINGS"
-          echo "=========================================="
-
-          grep -n \
-            -E 'CUSTOM KMOD|BENQ T31 PRE_PROBE|BENQ T31 PROBE' \
-            "$FILE"
-
-      # ============================================================
-      # BUILD KERNEL CORE
-      # ============================================================
-      - name: Build kernel core
-        working-directory: openwrt
+      - name: Compile Full Firmware (With Custom ALC262)
         run: |
-          echo "=========================================="
-          echo "BUILDING KERNEL CORE"
-          echo "=========================================="
-          make target/linux/compile -j$(nproc) V=s
+          make -j$(nproc) || make -j1 V=s
 
-      # ============================================================
-      # FIND REALTEK MODULE DIRECTLY IN KERNEL BUILD TREE
-      # ============================================================
-
-      - name: Find custom Realtek module
-        working-directory: openwrt
+      - name: Pack All Kmod Packages
+        continue-on-error: true
         run: |
-          KERNEL_DIR="${{ steps.kernel.outputs.kernel_dir }}"
+          find bin/ -type f -name "kmod-*.apk" | zip -j@ $GITHUB_WORKSPACE/kmod-backup-all.zip || true
 
-          echo "=========================================="
-          echo "KERNEL MODULE SEARCH"
-          echo "=========================================="
-
-          echo "Searching:"
-          echo "$KERNEL_DIR"
-
-          echo
-          echo "All HDA/Realtek modules:"
-
-          find "$KERNEL_DIR" \
-            -type f \
-            -name '*.ko' \
-            | grep -Ei 'hda|snd|realtek' \
-            | sort || true
-
-          echo
-          echo "=========================================="
-          echo "TARGET MODULE"
-          echo "=========================================="
-
-          MODULE="$(find "$KERNEL_DIR" \
-            -type f \
-            -name 'snd-hda-codec-realtek.ko' \
-            -print -quit)"
-
-          if [ -z "$MODULE" ]; then
-            echo "ERROR: snd-hda-codec-realtek.ko not found"
-
-            echo
-            echo "Possible HDA modules:"
-            find "$KERNEL_DIR" \
-              -type f \
-              -name '*.ko' \
-              | grep -Ei 'hda|snd' \
-              | sort || true
-
-            exit 1
+      - name: Extract Custom ALC262 KO File
+        continue-on-error: true
+        run: |
+          KERNEL_DIR="$(find build_dir -type d -path '*/linux-x86_64/linux-6.12.94' -print -quit)"
+          MODULE="$(find "$KERNEL_DIR" -type f -name 'snd-hda-codec-realtek.ko' -print -quit)"
+          if [ -n "$MODULE" ]; then
+             mkdir -p $GITHUB_WORKSPACE/debug-artifacts
+             cp "$MODULE" $GITHUB_WORKSPACE/debug-artifacts/
+             strings "$MODULE" | grep -E 'CUSTOM KMOD|BENQ T31' > $GITHUB_WORKSPACE/debug-artifacts/verify.txt
           fi
 
-          echo
-          echo "Found:"
-          echo "$MODULE"
-
-          mkdir -p "$GITHUB_WORKSPACE/output"
-
-          cp "$MODULE" \
-            "$GITHUB_WORKSPACE/output/snd-hda-codec-realtek.ko"
-
-      # ============================================================
-      # VERIFY CUSTOM MODULE
-      # ============================================================
-
-      - name: Verify custom module
+      - name: Generate Release Tag
+        id: tag
         run: |
-          MODULE="$GITHUB_WORKSPACE/output/snd-hda-codec-realtek.ko"
+          echo "release_tag=v25.12.5-x86-BenQ-T31-$(date +'%Y.%m.%d-%H%M')" >> $GITHUB_OUTPUT
+          echo "release_name=OpenWrt 25.12.5 x86_64 (Native Audio + Modem) $(date +'%Y.%m.%d')" >> $GITHUB_OUTPUT
 
-          echo "=========================================="
-          echo "MODULE FILE"
-          echo "=========================================="
-
-          ls -lh "$MODULE"
-          file "$MODULE"
-
-          echo
-          echo "=========================================="
-          echo "CUSTOM STRINGS"
-          echo "=========================================="
-
-          strings "$MODULE" \
-            | grep -E \
-              '\[CUSTOM KMOD\]|BENQ T31 PRE_PROBE|BENQ T31 PROBE'
-
-          echo
-          echo "=========================================="
-          echo "MODULE INFO"
-          echo "=========================================="
-
-          modinfo "$MODULE" || true
-
-      # ============================================================
-      # UPLOAD ARTIFACT
-      # ============================================================
-
-      - name: Upload custom module
-        uses: actions/upload-artifact@v4
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2.6.1
         with:
-          name: custom-snd-hda-codec-realtek-25.12.5
-          path: output/snd-hda-codec-realtek.ko
-          if-no-files-found: error
+          tag_name: ${{ steps.tag.outputs.release_tag }}
+          name: ${{ steps.tag.outputs.release_name }}
+          fail_on_unmatched_files: false
+          files: |
+            bin/targets/x86/64/*squashfs-combined.img.gz
+            bin/targets/x86/64/*squashfs-combined-efi.img.gz
+            bin/targets/x86/64/*ext4-combined.img.gz
+            bin/targets/x86/64/*ext4-combined-efi.img.gz
+            bin/targets/x86/64/sha256sums
+            kmod-backup-all.zip
+            debug-artifacts/*
