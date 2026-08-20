@@ -120,12 +120,6 @@ jobs:
           uci add_list network.Dell_DW5821e.allowedauth='none'
           uci set network.Dell_DW5821e.iptype='ipv4'
           uci set network.Dell_DW5821e.loglevel='ERR'
-
-          uci -q delete network.modem
-          uci set network.modem='interface'
-          uci set network.modem.proto='none'
-          uci set network.modem.device='wwan0'
-          uci set network.modem.force_link='1'
           
           # 4. Setup USB Tethering (HP)
           uci set network.usbwan="interface"
@@ -138,15 +132,21 @@ jobs:
           uci set wireless.@wifi-device[0].channel="11"
           uci set wireless.@wifi-device[0].htmode="HT20"
           uci set wireless.@wifi-iface[0].disabled="0"
-          uci set wireless.@wifi-iface[0].ssid="Linksys"
+          uci set wireless.@wifi-iface[0].ssid="BenQ"
           uci set wireless.@wifi-iface[0].key="12345678"
-          uci set wireless.@wifi-iface[0].encryption="none"
+          uci set wireless.@wifi-iface[0].encryption="sae-mixed"
           uci commit wireless
 
           # 6. Firewall - HANYA menempelkan usbwan ke zona WAN, ModemManager ditangani manual di LuCI
           WAN_IDX=$(uci show firewall | grep -F ".name='wan'" | cut -d. -f2 | cut -d= -f1)
           uci add_list firewall.${WAN_IDX}.network="usbwan"
-          # Catatan: interface 'wan' dan 'wan6' otomatis sudah tergabung ke zona firewall WAN oleh bawaan sistem
+          uci add firewall zone
+          uci set firewall.@zone[-1].name='dell'
+          uci set firewall.@zone[-1].input='REJECT'
+          uci set firewall.@zone[-1].output='ACCEPT'
+          uci set firewall.@zone[-1].forward='DROP'
+          uci add_list firewall.@zone[-1].network='Dell_DW5821e'
+          uci set firewall.@zone[-1].masq='1'
           uci commit firewall
           
           exit 0
@@ -189,7 +189,7 @@ jobs:
           echo "CONFIG_TARGET_ROOTFS_SQUASHFS=y" >> .config
           echo "CONFIG_ALL_KMODS=y" >> .config
           
-          PACKAGES="kmod-ath9k kmod-tun kmod-r8169 kmod-sound-core kmod-sound-hda-core kmod-sound-hda-intel kmod-ac97 kmod-sound-i8x0 alsa-utils wpad-basic-wolfssl kmod-usb-net-rtl8152 kmod-rtl8192se kmod-usb-ohci kmod-usb-ehci-pci kmod-usb2 kmod-pci kmod-i2c-piix4 kmod-ohci-pci kmod-ehci-pci kmod-k8temp kmod-radeon kmod-drm-radeon kmod-yenta-cardbus kmod-pcmcia-yenta kmod-firewire-ohci kmod-firewire-core kmod-tifm-7xx1 kmod-tifm-core kmod-sdhci-pci kmod-sdhci modemmanager modemmanager-rpcd libmbim libqmi luci-proto-modemmanager kmod-usb-serial-option kmod-usb-net-cdc-mbim umbim kmod-usb-acm kmod-usb-wdm kmod-usb-net-rndis parted losetup resize2fs blkid"
+          PACKAGES="kmod-snd-hda-scodec-component kmod-sound-hda-codec-realtek kmod-ath9k sshpass curl resolveip openssh-client stunnel dnsproxy ip-full lua luasocket luci-compat kmod-tun kmod-r8169 kmod-sound-core kmod-sound-hda-core kmod-sound-hda-intel kmod-ac97 kmod-sound-i8x0 alsa-utils wpad-basic-wolfssl kmod-usb-net-rtl8152 kmod-rtl8192se kmod-usb-ohci kmod-usb-ehci-pci kmod-usb2 kmod-pci kmod-i2c-piix4 kmod-ohci-pci kmod-ehci-pci kmod-k8temp kmod-radeon kmod-drm-radeon kmod-yenta-cardbus kmod-pcmcia-yenta kmod-firewire-ohci kmod-firewire-core kmod-tifm-7xx1 kmod-tifm-core kmod-sdhci-pci kmod-sdhci modemmanager modemmanager-rpcd libmbim libqmi luci-proto-modemmanager kmod-usb-serial-option kmod-usb-net-cdc-mbim umbim kmod-usb-acm kmod-usb-wdm kmod-usb-net-rndis parted losetup resize2fs blkid"
           
           for pkg in $PACKAGES; do
             echo "CONFIG_PACKAGE_$pkg=y" >> .config
@@ -203,60 +203,68 @@ jobs:
           make tools/install V=s
           make target/linux/prepare V=s
 
-      - name: Locate Kernel Source & Inject ALC262 Debug
+      - name: Patch ALC262 BenQ T31 Audio Fixup
         run: |
           KERNEL_DIR="$(find build_dir -type d -path '*/linux-x86_64/linux-6.12.94' -print -quit)"
-          if [ -z "$KERNEL_DIR" ]; then echo "ERROR: kernel dir not found"; exit 1; fi
-          
+          if [ -z "$KERNEL_DIR" ]; then
+            echo "❌ ERROR: kernel dir not found"
+            exit 1
+          fi
+
           FILE="$KERNEL_DIR/sound/pci/hda/patch_realtek.c"
-          test -f "$FILE"
-          
-          echo "Injecting ALC262 Custom KMOD to $FILE..."
-          
+
+          if [ ! -f "$FILE" ]; then
+            echo "❌ ERROR: $FILE not found"
+            exit 1
+          fi
+
+          echo "Patching ALC262 BenQ T31 in:"
+          echo "$FILE"
+
           python3 - "$FILE" <<'PY'
           import re
           import sys
 
           path = sys.argv[1]
+
           with open(path, "r", encoding="utf-8") as f:
               source = f.read()
 
-          if "alc262_fixup_benq_t31_debug" in source:
+          if "0x15, AC_VERB_SET_PIN_WIDGET_CONTROL" in source:
+              print("⚠️ Patch already present; nothing to do")
               sys.exit(0)
 
-          marker = "static const struct hda_fixup alc262_fixups[] = {"
-          code = r'''static void alc262_fixup_benq_t31_debug(struct hda_codec *codec,
-                                                            const struct hda_fixup *fix,
-                                                            int action)
-          {
-              if (action == HDA_FIXUP_ACT_PRE_PROBE) {
-                  codec_info(codec, "ALC262: [CUSTOM KMOD] BENQ T31 PRE_PROBE\n");
-                  snd_hda_codec_write(codec, 0x20, 0, AC_VERB_SET_COEF_INDEX, 0x07);
-                  snd_hda_codec_write(codec, 0x20, 0, AC_VERB_SET_PROC_COEF, 0x3050);
-              }
-              if (action == HDA_FIXUP_ACT_PROBE) {
-                  codec_info(codec, "ALC262: [CUSTOM KMOD] BENQ T31 PROBE\n");
-              }
-          }
-          '''
-          source = source.replace(marker, code + marker, 1)
+          # Regex kebal spasi/tab untuk mencari posisi array hda_verb BenQ T31
+          pattern = re.compile(
+              r'(\[ALC262_FIXUP_BENQ_T31\]\s*=\s*\{.*?'
+              r'\{\s*0x20,\s*AC_VERB_SET_PROC_COEF,\s*0x3050\s*\},)'
+              r'(\s*\{\}\s*\n*\s*\}\s*\n*\s*\},)',
+              re.DOTALL
+          )
 
-          pattern = re.compile(r'(\[ALC262_FIXUP_BENQ_T31\]\s*=\s*\{).*?(\n\s*\},)', re.DOTALL)
           match = pattern.search(source)
-          
-          if match:
-              replacement = match.group(1) + r'''
-                  .type = HDA_FIXUP_FUNC,
-                  .v.func = alc262_fixup_benq_t31_debug,
-              ''' + match.group(2)
-              source = source[:match.start()] + replacement + source[match.end():]
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(source)
-              print("✅ Injection successful!")
-          else:
-              print("❌ ERROR: ALC262 block not found!")
+
+          if not match:
+              print("❌ ERROR: Expected ALC262_FIXUP_BENQ_T31 block not found")
               sys.exit(1)
+
+          injection = r'''
+                /* BenQ Joybook T31: actual working audio output is NID 0x15 */
+                { 0x15, AC_VERB_SET_PIN_WIDGET_CONTROL, 0xc0 },
+                { 0x15, AC_VERB_SET_AMP_GAIN_MUTE, 0xb01f },'''
+
+          # Sisipkan verbs baru tepat sebelum penutup {}
+          source = source[:match.end(1)] + injection + match.group(2) + source[match.end():]
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(source)
+
+          print("✅ ALC262 BenQ T31 fixup patched successfully")
           PY
+
+          echo
+          echo "===== VERIFY PATCH ====="
+          grep -n -A12 -B2 "ALC262_FIXUP_BENQ_T31" "$FILE"
 
       - name: Download Packages
         run: |
@@ -270,17 +278,6 @@ jobs:
         continue-on-error: true
         run: |
           find bin/ -type f -name "kmod-*.apk" | zip -j@ $GITHUB_WORKSPACE/kmod-backup-all.zip || true
-
-      - name: Extract Custom ALC262 KO File
-        continue-on-error: true
-        run: |
-          KERNEL_DIR="$(find build_dir -type d -path '*/linux-x86_64/linux-6.12.94' -print -quit)"
-          MODULE="$(find "$KERNEL_DIR" -type f -name 'snd-hda-codec-realtek.ko' -print -quit)"
-          if [ -n "$MODULE" ]; then
-             mkdir -p $GITHUB_WORKSPACE/debug-artifacts
-             cp "$MODULE" $GITHUB_WORKSPACE/debug-artifacts/
-             strings "$MODULE" | grep -E 'CUSTOM KMOD|BENQ T31' > $GITHUB_WORKSPACE/debug-artifacts/verify.txt
-          fi
 
       - name: Generate Release Tag
         id: tag
@@ -296,9 +293,6 @@ jobs:
           fail_on_unmatched_files: false
           files: |
             bin/targets/x86/64/*squashfs-combined.img.gz
-            bin/targets/x86/64/*squashfs-combined-efi.img.gz
             bin/targets/x86/64/*ext4-combined.img.gz
-            bin/targets/x86/64/*ext4-combined-efi.img.gz
             bin/targets/x86/64/sha256sums
             kmod-backup-all.zip
-            debug-artifacts/*
