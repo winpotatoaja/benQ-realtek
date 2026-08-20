@@ -50,9 +50,10 @@ jobs:
           tar --zstd -xf llvm.tar.zst -C staging_dir/
           rm llvm.tar.zst
 
-      - name: Inject Custom Scripts (Resize, Modem, Network)
+      - name: Inject Custom Scripts (Resize, Modem, Network, Audio, Watchdog)
         run: |
           mkdir -p files/etc/uci-defaults
+          mkdir -p files/etc/init.d
           
           # [SCRIPT RESIZE PARTISI]
           cat << "EOF" > files/etc/uci-defaults/70-rootpt-resize
@@ -95,7 +96,103 @@ jobs:
           /etc/uci-defaults/80-rootfs-resize
           EOF
 
-          # [SCRIPT FIRST BOOT - Konfigurasi Jaringan]
+          # [SCRIPT 8: MODEM WATCHDOG]
+          cat << "EOF" > files/etc/init.d/modem-watchdog
+          #!/bin/sh /etc/rc.common
+          # /etc/init.d/modem-watchdog
+          # Smart Autofix untuk ModemManager di OpenWrt
+
+          START=99
+          STOP=10
+
+          log() {
+              logger -t modem-watchdog "$@"
+          }
+
+          start() {
+              # Dijalankan di background agar tidak mengunci proses booting OpenWrt
+              (
+                  log "=== Memulai pemantauan koneksi modem ==="
+
+                  # 1. CARI NAMA INTERFACE SECARA DINAMIS
+                  # Mencari interface di uci yang menggunakan protokol 'modemmanager'
+                  local IFACE=$(uci -q show network | grep "\.proto='modemmanager'" | awk -F. '{print $2}' | head -n 1)
+                  
+                  if [ -z "$IFACE" ]; then
+                      log "ERROR: Tidak ada antarmuka dengan protokol ModemManager yang ditemukan."
+                      exit 1
+                  fi
+                  log "Ditemukan antarmuka modem: '$IFACE'"
+
+                  # 2. PERIKSA & KUNCI OPTION DEVICE KE 'any'
+                  local DEVICE_OPT=$(uci -q get network."$IFACE".device)
+                  if [ "$DEVICE_OPT" != "any" ]; then
+                      log "Konfigurasi device masih '$DEVICE_OPT'. Mengubah ke 'any'..."
+                      uci set network."$IFACE".device='any'
+                      uci commit network
+                      # Reload network agar konfigurasi baru terbaca netifd
+                      /etc/init.d/network reload
+                      sleep 3
+                  fi
+
+                  # 3. LOOPING DETEKSI & EKSEKUSI (Batas 5 kali)
+                  local MAX_RETRIES=5
+                  local ATTEMPT=1
+                  
+                  while [ $ATTEMPT -le $MAX_RETRIES ]; do
+                      log "[Percobaan $ATTEMPT/$MAX_RETRIES] Menunggu kesiapan modem..."
+                      
+                      # Cek apakah ModemManager sudah melihat modem fisik (USB)
+                      if ! mmcli -L 2>/dev/null | grep -q "Modem"; then
+                          log "Modem belum muncul di ModemManager. Menunggu 5 detik..."
+                          sleep 5
+                          ATTEMPT=$((ATTEMPT + 1))
+                          continue
+                      fi
+
+                      # Dapatkan status interface (up/down) dan ada tidaknya IP
+                      local IS_UP=$(ifstatus "$IFACE" 2>/dev/null | grep '"up":' | grep -q 'true' && echo 1 || echo 0)
+                      local HAS_IP=$(ifstatus "$IFACE" 2>/dev/null | grep -q '"ipv4-address"' && echo 1 || echo 0)
+
+                      # Jika sudah dapat IP, langsung keluar dari skrip (Sukses)
+                      if [ $HAS_IP -eq 1 ]; then
+                          log "SUKSES! Antarmuka $IFACE sudah terhubung dan mendapatkan IP."
+                          exit 0
+                      fi
+
+                      # Logika Penanganan jika IP belum ada
+                      if [ $IS_UP -eq 0 ]; then
+                          log "Status: DOWN. Memicu ifup $IFACE..."
+                          ifup "$IFACE"
+                      else
+                          log "Status: UP tapi bengong (tidak ada IP). Memancing ulang bearer (ifdown & ifup)..."
+                          ifdown "$IFACE"
+                          sleep 3
+                          ifup "$IFACE"
+                      fi
+
+                      # Beri jeda 10 detik agar ModemManager dan operator sempat melakukan registrasi & DHCP
+                      sleep 10
+                      ATTEMPT=$((ATTEMPT + 1))
+                  done
+
+                  # 4. KONDISI GAGAL (Opsi Terakhir: Reset Hardware)
+                  log "GAGAL: Tidak mendapat IP setelah $MAX_RETRIES percobaan. Melakukan reset modem via mmcli..."
+                  local MODEM_IDX=$(mmcli -L | grep "Modem" | awk '{print $1}' | awk -F/ '{print $NF}')
+                  if [ -n "$MODEM_IDX" ]; then
+                      mmcli -m "$MODEM_IDX" --reset
+                  fi
+                  
+              ) &
+          }
+
+          stop() {
+              return 0
+          }
+          EOF
+          chmod +x files/etc/init.d/modem-watchdog
+
+          # [SCRIPT FIRST BOOT - Konfigurasi Jaringan & AUDIO]
           cat << "EOF" > files/etc/uci-defaults/99-custom-config
           # 1. Zona Waktu
           uci set system.@system[0].timezone='WIB-7'
@@ -137,7 +234,7 @@ jobs:
           uci set wireless.@wifi-iface[0].encryption="sae-mixed"
           uci commit wireless
 
-          # 6. Firewall - HANYA menempelkan usbwan ke zona WAN, ModemManager ditangani manual di LuCI
+          # 6. Firewall
           WAN_IDX=$(uci show firewall | grep -F ".name='wan'" | cut -d. -f2 | cut -d= -f1)
           uci add_list firewall.${WAN_IDX}.network="usbwan"
           uci add firewall zone
@@ -148,11 +245,30 @@ jobs:
           uci add_list firewall.@zone[-1].network='Dell_DW5821e'
           uci set firewall.@zone[-1].masq='1'
           uci commit firewall
+
+          # 7. Setup Audio Unmute saat Boot (ALSA)
+          cat << "INIT" > /etc/init.d/alsa-unmute
+          #!/bin/sh /etc/rc.common
+          START=99
+          start() {
+              sleep 2
+              amixer -c 0 sset Master 56% unmute >/dev/null 2>&1
+              amixer -c 0 sset Headphone 100% unmute >/dev/null 2>&1
+              amixer -c 0 sset Front 100% unmute >/dev/null 2>&1
+              amixer -c 0 sset PCM 100% unmute >/dev/null 2>&1
+              amixer -c 0 sset 'Auto-Mute Mode' Disabled >/dev/null 2>&1
+          }
+          INIT
+          chmod +x /etc/init.d/alsa-unmute
+          /etc/init.d/alsa-unmute enable
+
+          # 8. Aktifkan Modem Watchdog
+          /etc/init.d/modem-watchdog enable
           
           exit 0
           EOF
           chmod +x files/etc/uci-defaults/*
-
+          
       - name: Update and Install Feeds
         run: |
           ./scripts/feeds update -a
@@ -230,11 +346,12 @@ jobs:
           with open(path, "r", encoding="utf-8") as f:
               source = f.read()
 
-          if "0x15, AC_VERB_SET_PIN_WIDGET_CONTROL" in source:
-              print("⚠️ Patch already present; nothing to do")
+          # Pengaman: Cek komentar eksklusif kita
+          if "BenQ Joybook T31: actual working audio output is NID 0x15" in source:
+              print("⚠️ Patch ALREADY PRESENT in BenQ block; nothing to do")
               sys.exit(0)
 
-          # Regex kebal spasi/tab untuk mencari posisi array hda_verb BenQ T31
+          # Regex eksklusif blok BenQ_T31
           pattern = re.compile(
               r'(\[ALC262_FIXUP_BENQ_T31\]\s*=\s*\{.*?'
               r'\{\s*0x20,\s*AC_VERB_SET_PROC_COEF,\s*0x3050\s*\},)'
@@ -253,18 +370,44 @@ jobs:
                 { 0x15, AC_VERB_SET_PIN_WIDGET_CONTROL, 0xc0 },
                 { 0x15, AC_VERB_SET_AMP_GAIN_MUTE, 0xb01f },'''
 
-          # Sisipkan verbs baru tepat sebelum penutup {}
+          # Eksekusi Injeksi
           source = source[:match.end(1)] + injection + match.group(2) + source[match.end():]
 
           with open(path, "w", encoding="utf-8") as f:
               f.write(source)
 
-          print("✅ ALC262 BenQ T31 fixup patched successfully")
+          print("✅ Python Injection Script Finished")
           PY
 
           echo
-          echo "===== VERIFY PATCH ====="
-          grep -n -A12 -B2 "ALC262_FIXUP_BENQ_T31" "$FILE"
+          echo "===== VISUAL VERIFY PATCH ====="
+          grep -n -A15 -B2 "ALC262_FIXUP_BENQ_T31" "$FILE" || true
+
+          echo
+          echo "===== STRICT VERIFICATION (ISOLATED BLOCK) ====="
+          
+          # EKSTRAK HANYA BLOK BENQ T31 (Ambil baris judul dan 15 baris ke bawahnya)
+          BENQ_BLOCK=$(grep -A 15 "\[ALC262_FIXUP_BENQ_T31\]" "$FILE")
+
+          # 1. Pastikan ekstraksi berhasil menangkap bloknya
+          if [ -z "$BENQ_BLOCK" ]; then
+            echo "❌ STRICT ERROR: Gagal mengekstrak blok ALC262_FIXUP_BENQ_T31 dari file!"
+            exit 1
+          fi
+
+          # 2. Cek baris PIN_WIDGET_CONTROL hanya di dalam blok BenQ yang diekstrak
+          if ! echo "$BENQ_BLOCK" | grep -q "0x15, AC_VERB_SET_PIN_WIDGET_CONTROL, 0xc0"; then
+            echo "❌ STRICT ERROR: Baris PIN_WIDGET_CONTROL 0x15 TIDAK ADA DI DALAM blok BENQ_T31!"
+            exit 1
+          fi
+
+          # 3. Cek baris AMP_GAIN_MUTE hanya di dalam blok BenQ yang diekstrak
+          if ! echo "$BENQ_BLOCK" | grep -q "0x15, AC_VERB_SET_AMP_GAIN_MUTE, 0xb01f"; then
+            echo "❌ STRICT ERROR: Baris AMP_GAIN_MUTE 0x15 TIDAK ADA DI DALAM blok BENQ_T31!"
+            exit 1
+          fi
+
+          echo "✅ STRICT VERIFICATION PASSED: The magic lines are injected securely inside BENQ_T31 block!"
 
       - name: Download Packages
         run: |
